@@ -8,7 +8,7 @@ def main():
     print("==================================================")
     
     # 1. Map all .parquet files inside the 'data' folder
-    data_dir = '/mnt/shared/storage03/projects/cern/homes/gabriel.lisboa/data/ringer-datasets/mc21_isabela_qt_2sigma_restriction/data.parquet'
+    data_dir = './data.parquet'
     parquet_files = glob.glob(os.path.join(data_dir, '*.parquet'))
     
     if not parquet_files:
