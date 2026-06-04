@@ -1,1 +1,5 @@
+numpy
 polars
+matplotlib
+tqdm
+scikit-learn

@@ -1,0 +1,9 @@
+==================================================
+ RESULTADOS DO CONJUNTO DE VALIDAÇÃO CRUZADA      
+==================================================
+ -> Resultados armazenados em: results/14_rings/
+--------------------------------------------------
+ * Probabilidade de Detecção (P_D): 0.9829 ± 0.0012
+ * Probabilidade de Falso Alarme (F_A): 0.0261 ± 0.0017
+ * Índice Soma-Produto (SP_max): 0.9784 ± 0.0012
+==================================================

@@ -1,106 +1,140 @@
 import os
 import numpy as np
-import tensorflow as tf
+import math
 from sklearn.model_selection import StratifiedKFold
-from modules.cnn_model import NeuralRingerCNN
+from sklearn.utils.class_weight import compute_class_weight
+
+# Importa as nossas funções dos módulos
+from modules.cnn_model import build_v10_cnn
+from modules.sp_callback import SPMaxCheckpoint
 
 # ==============================================================================
-# HYPERPARAMETER CONFIGURATION
-# Modify these values to tune the network without altering the core logic
+# CONFIGURATION
 # ==============================================================================
 CONFIG = {
-    'data_dir': 'data',
-    'output_dir': 'models',
-    'k_folds': 10,
-    'epochs': 50,
-    'batch_size': 256,
+    'input_x': 'data/X_rings_normalized.npy',
+    'input_y': 'data/y_target.npy',
+    'base_data_dir': 'data',
+    'base_model_dir': 'models',
+    
+    # NOVO: Proporção de anéis a serem extraídos DE CADA CAMADA (ex: 0.5 = 50%)
+    'ring_proportion': 0.125, 
+    
+    'k_folds': 10,             
+    'epochs': 100,             
+    'batch_size': 256,         
     'learning_rate': 0.001,
-    'filters_1': 4,
-    'filters_2': 8,
-    'kernel_size': 2,
-    'hidden_units': 16,
-    'input_steps': 50,      #  First 50 concentric rings
-    'input_channels': 1
+    'patience': 3             
+}
+
+# Definição oficial dos 100 anéis concatenados por camada (Tabela 5.1 da Tese do Joao)
+ATLAS_LAYERS = {
+    'PS': 8,
+    'EM1': 64,
+    'EM2': 8,
+    'EM3': 8,
+    'HAD1': 4,
+    'HAD2': 4,
+    'HAD3': 4
 }
 # ==============================================================================
 
-def main():
-    print("==================================================")
-    print(" STARTING TRAINING - NEURAL RINGER FPGA           ")
-    print("==================================================")
-
-    os.makedirs(CONFIG['output_dir'], exist_ok=True)
-
-    # 1. Load Pre-processed Numpy Arrays
-    print("[Training] Loading dataset matrices...")
-    x_path = os.path.join(CONFIG['data_dir'], 'X_norm.npy')
-    y_path = os.path.join(CONFIG['data_dir'], 'y.npy')
-
-    X_norm = np.load(x_path)
-    y = np.load(y_path)
-    print(f"[Training] Data successfully loaded! X: {X_norm.shape} | y: {y.shape}")
-
-    # 2. Setup Stratified K-Fold Cross Validation
-    skf = StratifiedKFold(n_splits=CONFIG['k_folds'], shuffle=True, random_state=42)
+def get_layer_indices(proportion):
+    """
+    Calcula os índices exatos para fatiar a proporção desejada de anéis 
+    preservando a amostragem do núcleo do chuveiro em cada camada do calorímetro.
+    """
+    indices_to_keep = []
+    current_offset = 0
     
-    fold_no = 1
-    val_predictions = {}
-
-    for train_index, val_index in skf.split(X_norm, y):
-        print(f"\n--- Starting Fold {fold_no} / {CONFIG['k_folds']} ---")
-
-        X_train, X_val = X_norm[train_index], X_norm[val_index]
-        y_train, y_val = y[train_index], y[val_index]
-
-        # 3. Handle Class Imbalance via Class Weights
-        neg_count = np.sum(y_train == 0)
-        pos_count = np.sum(y_train == 1)
-        total = neg_count + pos_count
+    print("\n[*] Mapeamento de Anéis por Camada:")
+    for layer_name, total_rings in ATLAS_LAYERS.items():
+        # Calcula quantos anéis manter nesta camada (arredondando para o inteiro mais próximo)
+        keep_count = int(round(total_rings * proportion))
         
-        weight_for_0 = (1 / neg_count) * (total / 2.0)
-        weight_for_1 = (1 / pos_count) * (total / 2.0)
-        class_weight = {0: weight_for_0, 1: weight_for_1}
-        print(f"[Training] Class weights applied: Jet(0)={weight_for_0:.2f} | Electron(1)={weight_for_1:.2f}")
+        # Garante que pelo menos 1 anel seja mantido se a proporção for muito baixa
+        if keep_count == 0 and proportion > 0:
+            keep_count = 1 
+            
+        layer_indices = list(range(current_offset, current_offset + keep_count))
+        indices_to_keep.extend(layer_indices)
+        
+        print(f"    -> {layer_name}: {keep_count}/{total_rings} anéis mantidos (Índices {current_offset} a {current_offset + keep_count - 1})")
+        
+        current_offset += total_rings
+        
+    return indices_to_keep
 
-        # 4. Instantiate the configurable model
-        cnn_builder = NeuralRingerCNN(
-            input_shape=(CONFIG['input_steps'], CONFIG['input_channels']),
-            filters_1=CONFIG['filters_1'],
-            filters_2=CONFIG['filters_2'],
-            kernel_size=CONFIG['kernel_size'],
-            hidden_units=CONFIG['hidden_units'],
-            learning_rate=CONFIG['learning_rate']
+def main():
+    # 1. Mapeamento da nova janela baseada na proporção
+    proportion = CONFIG['ring_proportion']
+    selected_indices = get_layer_indices(proportion)
+    num_rings = len(selected_indices)
+    
+    print("==================================================")
+    print(f" SCRIPT 02: HYPO TRAINING - CNN 1D ({num_rings} RINGS) ")
+    print(f" PROPORÇÃO SELECIONADA: {proportion*100}% DE CADA CAMADA ")
+    print("==================================================")
+
+    current_model_dir = os.path.join(CONFIG['base_model_dir'], f'{num_rings}_rings')
+    current_data_dir = os.path.join(CONFIG['base_data_dir'], f'{num_rings}_rings')
+    
+    os.makedirs(current_model_dir, exist_ok=True)
+    os.makedirs(current_data_dir, exist_ok=True)
+    output_pred_file = os.path.join(current_data_dir, 'validation_predictions.npy')
+
+    # 2. Carregamento e Fatiamento Físico da Matriz
+    print(f"[*] Carregando e fatiando matrizes FEX...")
+    X_full = np.load(CONFIG['input_x'])
+    
+    # AGORA SIM! Fatiamos pegando os índices espaciais corretos de cada camada
+    X = X_full[:, selected_indices] 
+    y = np.load(CONFIG['input_y'])
+    X = np.expand_dims(X, axis=-1)
+
+    skf = StratifiedKFold(n_splits=CONFIG['k_folds'], shuffle=True, random_state=42)
+    validation_predictions = {}
+
+    # 3. Treinamento Orientado pelo K-Fold
+    for fold, (train_idx, val_idx) in enumerate(skf.split(X, y), 1):
+        print(f"\n--- Iniciando Treinamento do Fold {fold}/{CONFIG['k_folds']} ---")
+        
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_val, y_val = X[val_idx], y[val_idx]
+        
+        classes = np.unique(y_train)
+        weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train)
+        class_weight_dict = dict(zip(classes, weights))
+        
+        # A rede neural é construída com o número total de anéis extraídos
+        model = build_v10_cnn(input_length=num_rings, learning_rate=CONFIG['learning_rate'])
+        model_path = os.path.join(current_model_dir, f'cnn_fold_{fold}.h5')
+        
+        sp_checkpoint = SPMaxCheckpoint(
+            X_val=X_val, 
+            y_val=y_val, 
+            filepath=model_path, 
+            patience=CONFIG['patience']
         )
-        model = cnn_builder.get_model()
-
-        # 5. Train the model
-        history = model.fit(
-            X_train, y_train,
-            validation_data=(X_val, y_val),
-            epochs=CONFIG['epochs'],
-            batch_size=CONFIG['batch_size'],
-            class_weight=class_weight,
-            verbose=1
-        )
-
-        # 6. Save the Fold Weights
-        model_path = os.path.join(CONFIG['output_dir'], f"cnn1d_ringer_fold_{fold_no}.h5")
-        model.save(model_path)
-        print(f"[Training] Model weights saved at: {model_path}")
-
-        # 7. Save raw predictions for the validation set (Needed for Script 03 - SP Index)
-        preds = model.predict(X_val, verbose=0)
-        val_predictions[f"fold_{fold_no}"] = {
+        
+        model.fit(X_train, y_train,
+                  validation_data=(X_val, y_val),
+                  epochs=CONFIG['epochs'],
+                  batch_size=CONFIG['batch_size'],
+                  class_weight=class_weight_dict,
+                  callbacks=[sp_checkpoint], 
+                  verbose=1)
+        
+        print(f"[*] Extraindo predições do pico de SP_max...")
+        y_pred = model.predict(X_val).flatten()
+        
+        validation_predictions[f'fold_{fold}'] = {
             'y_true': y_val,
-            'y_pred': preds.flatten()
+            'y_pred': y_pred
         }
 
-        fold_no += 1
-
-    # 8. Export all predictions for the evaluation script
-    preds_path = os.path.join(CONFIG['output_dir'], 'validation_predictions.npy')
-    np.save(preds_path, val_predictions, allow_pickle=True)
-    print(f"\n[Training] K-Fold Cross-validation completed! Predictions dictionary saved at: {preds_path}")
+    np.save(output_pred_file, validation_predictions)
+    print(f"\n[SUCESSO] Treinamento concluído e orientado pelo SP_max!")
 
 if __name__ == "__main__":
     main()
